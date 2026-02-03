@@ -1,0 +1,214 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from thop import profile, clever_format
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from blocks.InvertedResidual import InvertedResidual
+from blocks.ASPP import ASPP
+from blocks.Soft_pooling import downsample_soft
+from blocks.EPSA import EPSABlock
+from blocks.MulScale_Att import MultiScaleAttention
+from blocks.scale_attention import scale_atten_convblock_softpool
+from blocks.reshape import reshaped
+
+from utils.init import *
+
+# ==========================================
+# 1. PLACEHOLDER BLOCKS (DELETE THIS SECTION)
+# ==========================================
+# REPLACE THESE with your actual imports: 
+# from blocks.InvertedResidual import InvertedResidual
+# from blocks.ASPP import ASPP
+# ... etc
+
+# ==========================================
+# 2. YOUR MODEL DEFINITION
+# ==========================================
+
+class ResEncoder(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(ResEncoder, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=False)
+        self.conv1x1 = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        residual = self.conv1x1(x)
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = out + residual
+        out = self.relu(out)
+        return out
+
+class DoubleConv(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super(DoubleConv, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True)
+        )
+
+    def forward(self, x):
+        return self.conv(x)
+
+class UP(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(UP, self).__init__()
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+
+    def forward(self, x):
+        x = self.up(x)
+        return x
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
+class EIU_Net(nn.Module):
+    def __init__(self, n_channels, n_classes):
+        super(EIU_Net, self).__init__()
+        self.n_channels = n_channels
+        self.n_classes = n_classes
+
+        filters = [32, 64, 128, 256, 512]
+
+        self.enc_input = ResEncoder(self.n_channels, filters[0])
+        self.encoder_1 = InvertedResidual(filters[0], filters[1])
+        self.encoder_2 = InvertedResidual(filters[1], filters[2])
+        self.encoder_3 = InvertedResidual(filters[2], filters[3])
+        self.encoder_4 = EPSABlock(filters[3], 128)
+        self.downsample = downsample_soft()
+        self.aspp = ASPP(filters[4], [6, 12, 18])
+
+        self.decoder_4 = UP(filters[4], filters[3])
+        self.double_conv_4 = DoubleConv(filters[4], filters[3])
+        self.decoder_3 = UP(filters[3], filters[2])
+        self.double_conv_3 = DoubleConv(filters[3], filters[2])
+        self.decoder_2 = UP(filters[2], filters[1])
+        self.double_conv_2 = DoubleConv(filters[2], filters[1])
+        self.decoder_1 = UP(filters[1], filters[0])
+        self.double_conv_1 = DoubleConv(filters[1], filters[0])
+
+        self.reshape_4 = reshaped(in_size=256, out_size=4, scale_factor=(256, 256))
+        self.reshape_3 = reshaped(in_size=128, out_size=4, scale_factor=(256, 256))
+        self.reshape_2 = reshaped(in_size=64, out_size=4, scale_factor=(256, 256))
+        self.reshape_1 = nn.Conv2d(in_channels=32, out_channels=4, kernel_size=1)
+        self.scale_att = scale_atten_convblock_softpool(in_size=16, out_size=4)
+
+        self.final = OutConv(4, self.n_classes)
+
+        self.mul_scale_att_1 = MultiScaleAttention(32, 64, 64)
+        self.mul_scale_att_2 = MultiScaleAttention(64, 128, 128)
+        self.mul_scale_att_3 = MultiScaleAttention(128, 256, 256)
+
+    def forward(self, x):
+        enc_input = self.enc_input(x)
+        down1 = self.downsample(enc_input)
+        enc_1 = self.encoder_1(down1)
+        mid_attention_1 = self.downsample(self.mul_scale_att_1(enc_input, enc_1))
+        
+        down2 = self.downsample(enc_1)
+        enc_2 = self.encoder_2(down2)
+        mid_attention_2 = self.downsample(self.mul_scale_att_2(enc_1, enc_2))
+        
+        down3 = self.downsample(enc_2)
+        enc_3 = self.encoder_3(down3)
+        mid_attention_3 = self.downsample(self.mul_scale_att_3(enc_2, enc_3))
+        
+        down4 = self.downsample(enc_3)
+        enc_4 = self.encoder_4(down4)
+        enc_4 = self.aspp(enc_4)
+        
+        up4 = self.decoder_4(enc_4)
+        concat_4 = torch.cat((mid_attention_3, up4), dim=1)
+        up4 = self.double_conv_4(concat_4)
+        
+        up3 = self.decoder_3(up4)
+        concat_3 = torch.cat((mid_attention_2, up3), dim=1)
+        up3 = self.double_conv_3(concat_3)
+        
+        up2 = self.decoder_2(up3)
+        concat_2 = torch.cat((mid_attention_1, up2), dim=1)
+        up2 = self.double_conv_2(concat_2)
+        
+        up1 = self.decoder_1(up2)
+        concat_1 = torch.cat((enc_input, up1), dim=1)
+        up1 = self.double_conv_1(concat_1)
+        
+        dsv4 = self.reshape_4(up4)
+        dsv3 = self.reshape_3(up3)
+        dsv2 = self.reshape_2(up2)
+        dsv1 = self.reshape_1(up1)
+        
+        dsv_cat = torch.cat([dsv1, dsv2, dsv3, dsv4], dim=1)
+        out = self.scale_att(dsv_cat)
+        final = self.final(out)
+        
+        return final
+
+# ==========================================
+# 3. GFLOPS CALCULATION
+# ==========================================
+
+def calculate_gflops():
+    # 1. Setup Model and Device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    n_channels = 3  # Assuming RGB input, change to 1 if grayscale
+    n_classes = 1   # Change based on your problem
+    model = EIU_Net(n_channels=n_channels, n_classes=n_classes).to(device)
+    model.eval()
+
+    # 2. Define Input Tensor (Batch Size of 1 is standard for GFLOPs)
+    # Standard medical image size 256x256
+    input_size = (1, n_channels, 512, 512) 
+    input_tensor = torch.randn(input_size).to(device)
+
+    print(f"[-] Calculating GFLOPs for input size: {input_size}")
+
+    # 3. Calculate using THOP (Handles recursive sub-modules automatically)
+    # THOP traces the graph, so it counts operations inside your custom blocks
+    # as long as they use standard PyTorch ops (Conv2d, Linear, etc.)
+    macs, params = profile(model, inputs=(input_tensor, ), verbose=False)
+
+    # 2. Convert to Giga-units
+    # Note: thop returns 'macs', so we divide by 1e9 to get GMACs
+    gmacs = macs / 1e9
+    
+    # 3. Convert to GFLOPs
+    # Standard convention: 1 MAC = 2 FLOPs
+    gflops = gmacs * 2 
+
+    params_m = params / 1e6
+
+    print("=" * 30)
+    print(f"Model: EIU_Net")
+    print(f"Input Resolution: {input_size[2]}x{input_size[3]}")
+    print("-" * 30)
+    print(f"Total Params: {params_m:.3f} M")
+    print(f"Total GMACs:  {gmacs:.3f} G (What thop calculates)")
+    print(f"Total GFLOPs: {gflops:.3f} G (Standard metric for papers)")
+    print("=" * 30)
+
+    # 5. (Optional) Detailed breakdown if you need to debug specific layers
+    # This loop shows that THOP is indeed capturing the custom layers
+    # print("\nLayer-wise check (Top level):")
+    # for name, module in model.named_children():
+    #     if hasattr(module, 'total_ops'):
+    #         print(f"{name}: {module.total_ops / 1e9:.4f} GFLOPs")
+
+if __name__ == '__main__':
+    calculate_gflops()
